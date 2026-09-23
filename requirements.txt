@@ -1,0 +1,12 @@
+torch
+transformers
+peft
+einops
+jaxtyping
+accelerate
+datasets
+huggingface_hub
+sentencepiece
+protobuf
+tqdm
+numpy

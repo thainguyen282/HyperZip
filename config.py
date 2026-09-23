@@ -88,6 +88,7 @@ class ModelConfig:
     model_path: str = QWEN_PATH
     revision: str | None = None
     tokenizer_path: str | None = None
+    lora_path: str | None = None
     device: str = "auto"
     dtype: str = "auto"
     trust_remote_code: bool = False
@@ -233,15 +234,10 @@ def get_hypernetwork_args(model_name):
 
 def add_pipeline_arguments(encode, decode):
     data = encode.add_argument_group("Input")
-    source = data.add_mutually_exclusive_group(required=True)
-    source.add_argument("--input", "--input_file", dest="input_file")
-    source.add_argument("--benchmark_manifest")
-    data.add_argument("--collection")
-    data.add_argument("--input_format", choices=("text", "jsonl"), default="text")
-    data.add_argument("--modality", default="text")
-    data.add_argument("--input_chunk_bytes", type=int, default=1024**2)
-    data.add_argument("--start_document", type=int, default=0)
-    data.add_argument("--max_documents", type=int)
+    data.add_argument("--input", "--input_file", dest="input_file", required=True,
+                      help="UTF-8 text file, read in full as one record")
+    encode.set_defaults(modality="text")
+    encode.add_argument("--metrics_output", help="Metrics JSON path (default: <output>.metrics.json)")
     decode.add_argument("--input", dest="archive", required=True)
 
     coding = encode.add_argument_group("Arithmetic coding")
@@ -267,6 +263,7 @@ def add_model_arguments(encode, decode):
     decode.add_argument("--model_path")
     decode.add_argument("--tokenizer", dest="tokenizer_path")
     for command in (encode, decode):
+        command.add_argument("--lora_path", help="Local saved PEFT LoRA directory (optional)")
         command.add_argument("--device", default="auto")
         command.add_argument("--trust_remote_code", action="store_true")
         command.add_argument("--local_files_only", action="store_true")
@@ -303,14 +300,6 @@ def autoregressive_model_config(args):
     )
 
 
-def add_hyperzip_arguments(encode, decode):
-    for command in (encode, decode):
-        if command is encode:
-            command.add_argument("--personalization", choices=("none", "hyperzip"), default="none")
-        command.add_argument("--hyperzip_path")
-        command.add_argument("--hypernetwork_checkpoint")
-
-
 def get_model_config(args, archive_header=None):
     if args.command == "encode":
         return args.model_config
@@ -323,29 +312,25 @@ def get_model_config(args, archive_header=None):
     if args.device != "auto":
         config.device = args.device
     if args.model_path or args.tokenizer_path:
-        if not archive_header.get("personalization"):
-            raise ValueError("Model relocation requires a fingerprinted personalized archive")
-        config.model_path = args.model_path or config.model_path
-        config.tokenizer_path = args.tokenizer_path or config.tokenizer_path
+        raise ValueError("Base-model/tokenizer relocation is not supported; use the archived paths")
+    saved_lora = archive_header.get("lora")
+    if args.lora_path and not saved_lora:
+        raise ValueError("Cannot use a LoRA adapter to decode a base-model archive")
+    config.lora_path = (args.lora_path or saved_lora["path"]) if saved_lora else None
     return config
 
 
 def _validate_encode_args(args, parser):
-    if args.modality != "text":
-        parser.error("Only text input is implemented")
-    if min(args.input_chunk_bytes, args.block_size) < 1:
-        parser.error("Chunk and coding block sizes must be positive")
+    if args.block_size < 1:
+        parser.error("Coding block size must be positive")
     if not 1 <= args.frequency_precision <= 30:
         parser.error("Frequency precision must be between 1 and 30")
     if not 0 <= args.seed < 2**32:
         parser.error("Seed must be between 0 and 2**32 - 1")
-    if args.start_document < 0 or (args.max_documents is not None and args.max_documents < 0):
-        parser.error("Document offsets and limits must be nonnegative")
 
     try:
         diffusion = diffus_model_config(args)
         autoregressive = autoregressive_model_config(args)
-        get_personalization_config(args)
     except ValueError as error:
         parser.error(str(error))
 
@@ -354,6 +339,7 @@ def _validate_encode_args(args, parser):
         model_path=args.model_path or default_model_path(args.model),
         revision=args.revision or default_model_revision(args.model),
         tokenizer_path=args.tokenizer_path,
+        lora_path=args.lora_path,
         device=args.device,
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
@@ -374,9 +360,9 @@ def parse_args(argv=None):
     add_model_arguments(encode, decode)
     add_diffusion_arguments(encode)
     add_autoregressive_arguments(encode)
-    add_hyperzip_arguments(encode, decode)
 
     args = parser.parse_args(argv)
     if args.command == "encode":
+        args.metrics_output = args.metrics_output or f"{args.output}.metrics.json"
         _validate_encode_args(args, parser)
     return args
