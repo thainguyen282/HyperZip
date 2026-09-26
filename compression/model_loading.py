@@ -92,7 +92,7 @@ def _omni_environment():
         raise RuntimeError(f"Omni requires transformers==4.51.3; found {installed}. Use the dedicated Omni environment.")
     # Upstream FunASR invokes pip. Constrain its dependencies in this process.
     os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
-    constraints = str(Path(__file__).resolve().parents[1] / "requirements-pipeline-omni.txt")
+    constraints = str(Path(__file__).resolve().parents[1] / "requirements-omni.txt")
     existing = os.environ.get("PIP_CONSTRAINT", "").split()
     if constraints not in existing:
         os.environ["PIP_CONSTRAINT"] = " ".join(existing + [constraints])
@@ -104,7 +104,7 @@ def _configure_cuda_home():
         candidates = [os.environ.get("CUDA_PATH"), os.environ.get("EBROOTCUDA")]
         if nvcc:
             candidates.append(str(Path(nvcc).resolve().parent.parent))
-        candidates.extend(["/usr/local/cuda", "/mmfs1/apps/easybuild/software/CUDA/12.4.0"])
+        candidates.append("/usr/local/cuda")
         for candidate in candidates:
             if candidate and (Path(candidate) / "bin/nvcc").is_file():
                 os.environ["CUDA_HOME"] = candidate
@@ -139,7 +139,7 @@ def load_fast_dllm(config):
     if not config.trust_remote_code:
         raise ValueError("Fast-dLLM requires --trust_remote_code for checkpoint-provided Python")
     if importlib.metadata.version("transformers") != "4.53.1":
-        raise RuntimeError("Fast-dLLM requires transformers==4.53.1; use HyperZip/.venv")
+        raise RuntimeError("Fast-dLLM requires transformers==4.53.1; install requirements.txt in a separate environment")
     from .model import FastDLLMModel
     import torch
     from huggingface_hub import snapshot_download
