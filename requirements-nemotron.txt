@@ -1,0 +1,10 @@
+# Tested Nemotron inference environment: use a separate Python 3.12 environment.
+# Install separately from Fast-dLLM/HyperZip and Omni.
+# Tested CUDA build: torch 2.12.1+cu126.
+torch==2.12.1
+transformers==5.12.1
+numpy==2.5.0
+tqdm==4.68.3
+safetensors==0.8.0
+tokenizers==0.22.2
+sentencepiece==0.2.1
