@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Experiment artifacts and local weights (examples and tests stay tracked).
+/results/
+/adapters/
+/checkpoints/
+*.partial
