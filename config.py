@@ -2,38 +2,23 @@
 
 import argparse
 from dataclasses import dataclass
-from pathlib import Path
-from types import SimpleNamespace
 
 
-ROOT = Path(__file__).resolve().parent
 OMNI_REVISION = "2233ee1ae2aa2b63e00466197afdeea0ca9e0901"
-HYPERZIP_PATH = str(ROOT / "HyperZip")
 
 MODEL_PATHS = {
-    "qwen": str(ROOT / "base_checkpoint/Qwen2.5-0.5B-Instruct"),
+    "qwen": "Qwen/Qwen2.5-0.5B-Instruct",
     "omni": "lijiang/Omni-Diffusion",
     "nemotron": "nvidia/Nemotron-Labs-Diffusion-3B",
-    "fast_dllm": str(ROOT / "base_checkpoint/Fast_dLLM_v2_1.5B"),
+    "fast_dllm": "Efficient-Large-Model/Fast_dLLM_v2_1.5B",
 }
 # The autoregressive family defaults to Qwen; --model_path selects the checkpoint.
 MODEL_PATHS["autoregressive"] = MODEL_PATHS["qwen"]
 AUTOREGRESSIVE_MODELS = ("autoregressive", "qwen")
 DIFFUSION_MODELS = ("fast_dllm", "nemotron")
 
-HYPERNETWORK_CHECKPOINT = str(
-    Path(HYPERZIP_PATH)
-    / "train_outputs/fineweb_edu_100k/text_to_lora_1.5b_1/checkpoint.pt"
-)
-
-# Kept for modules that import these constants directly.
 QWEN_PATH = MODEL_PATHS["qwen"]
-OMNI_MODEL = MODEL_PATHS["omni"]
-FAST_DLLM_PATH = MODEL_PATHS["fast_dllm"]
 FAST_DLLM_MASK_ID = 151665
-BASE_MODEL = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
-EMBEDDING_MODEL = "Alibaba-NLP/gte-large-en-v1.5"
-PROFILE = "hyperzip_fast_dllm_hooks_v1"
 
 
 @dataclass
@@ -144,13 +129,6 @@ class ModelConfig:
         return cls(**values)
 
 
-@dataclass
-class PersonalizationConfig:
-    mode: str = "none"
-    hyperzip_path: str = HYPERZIP_PATH
-    checkpoint_path: str = HYPERNETWORK_CHECKPOINT
-
-
 def default_model_path(model):
     return MODEL_PATHS.get(model, QWEN_PATH)
 
@@ -202,33 +180,6 @@ def diffus_model_config(args, archive_header=None):
     return get_diffusion_config(
         args.model, args.attention_block_size, args.use_kv_cache, args.use_dual_cache,
         args.small_block_size, args.cache_context_tokens, args.confidence_threshold, args.fast_inference,
-    )
-
-
-def get_personalization_config(args, archive_header=None):
-    saved = (archive_header or {}).get("personalization")
-    if args.command == "decode":
-        config = PersonalizationConfig(**saved["config"]) if saved else PersonalizationConfig()
-    else:
-        if args.personalization == "hyperzip" and args.model != "fast_dllm":
-            raise ValueError("HyperZip personalization requires --model fast_dllm")
-        config = PersonalizationConfig(mode=args.personalization)
-
-    config.hyperzip_path = args.hyperzip_path or config.hyperzip_path
-    config.checkpoint_path = args.hypernetwork_checkpoint or config.checkpoint_path
-    return config
-
-
-def get_hypernetwork_args(model_name):
-    """Settings expected by HyperZip's make_hypermod function."""
-    return SimpleNamespace(
-        training_task="sft", target_modules=["q_proj", "v_proj"],
-        train_ds_names=["fineweb_edu"], model_dir=model_name,
-        use_one_hot_task_emb=False, shared_AB_head=False, autoreg_gen=False,
-        learnable_pos_emb=False, learnable_AB_offset=False,
-        hypernet_latent_size=512, head_in_size=2048, encoder_type="linear",
-        mt_lora_path=None, pred_z_score=True, factorized=False,
-        delta_w_scaling=10000,
     )
 
 

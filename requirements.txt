@@ -1,12 +1,11 @@
-torch
-transformers
-peft
-einops
-jaxtyping
-accelerate
-datasets
-huggingface_hub
-sentencepiece
-protobuf
-tqdm
-numpy
+# Python 3.10+; autoregressive models and Fast-dLLM.
+# Reproduces the reference pipeline environment. Install CUDA-compatible Torch as needed.
+numpy==1.26.4
+torch==2.6.0
+transformers==4.53.1
+peft==0.15.2
+accelerate==1.6.0
+safetensors==0.5.3
+tqdm==4.67.1
+huggingface-hub==0.36.2
+einops==0.8.2
