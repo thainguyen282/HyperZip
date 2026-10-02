@@ -11,6 +11,8 @@ from zipfile import ZIP_STORED, ZipFile
 
 FORMAT = "session_compression_v1"
 LORA_FORMAT = "session_compression_lora_v1"
+HYPERNETWORK_FORMAT = "session_compression_hypernetwork_v1"
+CONTEXT_FILE = "context.f32"
 QUANTIZATION = "positive_floor_v1"
 PAYLOAD_FILE = "record_000000.bin"
 
@@ -20,6 +22,7 @@ class CompressedFile:
     header: dict
     metadata: dict
     payload: bytes
+    context: bytes | None = None
 
 
 def _sha(data):
@@ -74,7 +77,7 @@ def read_archive(path):
         raise ValueError("Directory archives are no longer supported; expected a single compressed file")
     with ZipFile(path) as archive:
         header = json.loads(archive.read("manifest.json"))
-        if header.get("format") not in {FORMAT, LORA_FORMAT} or header.get("personalization") is not None:
+        if header.get("format") not in {FORMAT, LORA_FORMAT, HYPERNETWORK_FORMAT} or header.get("personalization") is not None:
             raise ValueError("Unsupported archive format; runtime HyperZip archives are no longer supported")
         if (header.get("quantization") != QUANTIZATION or header.get("modality") != "text"
                 or header.get("layout") != "concatenated" or type(header.get("record_count")) is not int
@@ -91,6 +94,23 @@ def read_archive(path):
                 raise ValueError("Missing or invalid saved LoRA metadata")
         elif lora is not None or header["model"].get("lora_path") is not None:
             raise ValueError("LoRA metadata requires the saved-LoRA archive format")
+        hypernetwork = header.get("hypernetwork")
+        context = None
+        if header['format'] == HYPERNETWORK_FORMAT:
+            if (not isinstance(hypernetwork, dict)
+                    or any(not isinstance(hypernetwork.get(key), str) or not hypernetwork[key]
+                           for key in ('path', 'config_sha256', 'weights_sha256', 'context_sha256', 'adapter_sha256'))
+                    or type(hypernetwork.get('embedding_dim')) is not int
+                    or not 0 < hypernetwork['embedding_dim'] <= 65536
+                    or hypernetwork.get('generator') != 'cpu_fp32_v1'):
+                raise ValueError('Invalid hypernetwork metadata')
+            if archive.getinfo(CONTEXT_FILE).file_size != 4 * hypernetwork['embedding_dim']:
+                raise ValueError('Context vector size mismatch')
+            context = archive.read(CONTEXT_FILE)
+            if _sha(context) != hypernetwork['context_sha256']:
+                raise ValueError('Context vector checksum mismatch')
+        elif hypernetwork is not None:
+            raise ValueError('Hypernetwork metadata requires the hypernetwork archive format')
         records = archive.read("records.jsonl")
         if _sha(records) != header["records_sha256"]:
             raise ValueError("Record metadata checksum mismatch")
@@ -106,16 +126,19 @@ def read_archive(path):
             if type(metadata.get(key)) is not int or metadata[key] < 0:
                 raise ValueError(f"Invalid record size: {key}")
         members = archive.infolist()
-        if (len(members) != 3 or {info.filename for info in members}
-                != {"manifest.json", "records.jsonl", PAYLOAD_FILE}
+        expected_members = {"manifest.json", "records.jsonl", PAYLOAD_FILE}
+        if hypernetwork:
+            expected_members.add(CONTEXT_FILE)
+        if (len(members) != len(expected_members) or {info.filename for info in members}
+                != expected_members
                 or any(info.compress_type != ZIP_STORED for info in members)):
-            raise ValueError("Expected exactly three ZIP_STORED archive members")
+            raise ValueError("Unexpected or duplicate ZIP_STORED archive members")
         payload = archive.read(PAYLOAD_FILE)
         if _sha(payload) != metadata["payload_sha256"]:
             raise ValueError("Compressed payload checksum mismatch")
     if header["runtime"] != _runtime_versions():
         raise ValueError("Decode with the same NumPy, Torch, and Transformers versions as encoding")
-    return CompressedFile(header, metadata, payload)
+    return CompressedFile(header, metadata, payload, context)
 
 
 @contextmanager
@@ -130,9 +153,11 @@ def _temporary(destination):
         path.unlink(missing_ok=True)
 
 
-def write_archive(args, schedule, raw, payload, token_count, seconds, lora=None):
+def write_archive(args, schedule, raw, payload, token_count, seconds, lora=None, hypernetwork=None):
     """Publish a completed ZIP and separate metrics; never invoke a model."""
     validate_output_paths(args)
+    if lora and hypernetwork:
+        raise ValueError('Cannot combine saved and generated adapters')
     output, metrics_output = Path(args.output), Path(args.metrics_output)
     metadata = {
         "index": 0, "source": str(args.input_file), "file": PAYLOAD_FILE,
@@ -149,9 +174,14 @@ def write_archive(args, schedule, raw, payload, token_count, seconds, lora=None)
     }
     if lora:
         header["lora"] = lora
+    if hypernetwork:
+        header['format'] = HYPERNETWORK_FORMAT
+        header['hypernetwork'] = hypernetwork['header']
     with _temporary(output) as partial, _temporary(metrics_output) as metrics_partial:
         with ZipFile(partial, "w", compression=ZIP_STORED) as archive:
             archive.writestr(PAYLOAD_FILE, payload)
+            if hypernetwork:
+                archive.writestr(CONTEXT_FILE, hypernetwork['context'])
             archive.writestr("records.jsonl", records)
             archive.writestr("manifest.json", json.dumps(header, indent=2) + "\n")
         original, compressed_bytes = len(raw), partial.stat().st_size
@@ -166,6 +196,9 @@ def write_archive(args, schedule, raw, payload, token_count, seconds, lora=None)
             "compression_seconds": seconds,
             "tokens_per_second": token_count / seconds if seconds > 0 else None,
         }
+        if hypernetwork:
+            metrics['context_bytes'] = len(hypernetwork['context'])
+            metrics['personalization_seconds'] = hypernetwork['personalization_seconds']
         metrics_partial.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
         # Publish completed files without overwriting a concurrently created path.
         os.link(partial, output)

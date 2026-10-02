@@ -13,7 +13,7 @@ from .probability import ProbabilityDistribution
 
 @dataclass(frozen=True)
 class Prediction:
-    position: int  # Position within this session, independent of coding order.
+    position: int  # Position within this session, independent of coding order.  
     distribution: ProbabilityDistribution
 
 
@@ -288,7 +288,7 @@ class OmniModel(DiffusionModel):
 
 
 class FastDLLMModel(DiffusionModel):
-    """Masked Fast-dLLM prediction, with the checkpoint's one-token logit shift."""
+    """Masked Fast-dLLM prediction, with the checkpoint's one-token logit shift."""  
 
     schedule = "fast_dllm_bos_shifted_left_to_right_v1"
 
