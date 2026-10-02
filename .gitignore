@@ -222,3 +222,7 @@ __marimo__/
 /adapters/
 /checkpoints/
 *.partial
+
+tests/
+datasets/
+examples/
