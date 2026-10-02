@@ -1,5 +1,6 @@
-"""Compress or decompress one text file with an optional saved LoRA adapter."""
+"""Compress or decompress text with optional saved or generated LoRA weights."""
 from dataclasses import asdict
+from contextlib import ExitStack
 from pathlib import Path
 import gc
 import json
@@ -25,18 +26,26 @@ def run(args):
         raise ValueError(f"Unknown command: {args.command!r}")
     validate_output_paths(args)
     model = None
+    resources = ExitStack()
     try:
         raw = read_text_file(args.input_file) if args.command == "encode" else None
         archive = read_archive(args.archive) if args.command == "decode" else None
         header = archive.header if archive else None
         config = get_model_config(args, header)
+        personalized = None
+        if args.hypernetwork_path or (header or {}).get("hypernetwork"):
+            from hypernetwork.runtime import prepare, attach
+            personalized = prepare(args, config, raw=raw, archive=archive)
         logger.info("Loading %s: %s", config.model, config.model_path)
         model = load_model(config, expected_lora=(header or {}).get("lora"))
+        if personalized:
+            resources.enter_context(attach(personalized, config, model.model))
         logger.info("Model settings: %s", json.dumps(asdict(config)))
         if args.command == "encode":
-            return encode_archive(args, model, raw)
+            return encode_archive(args, model, raw, personalized=personalized)
         return decode_archive(args, model, archive)
     finally:
+        resources.close()
         import torch
         model = None
         gc.collect()
@@ -44,7 +53,7 @@ def run(args):
             torch.cuda.empty_cache()
 
 
-def encode_archive(args, model, raw=None):
+def encode_archive(args, model, raw=None, personalized=None):
     """Tokenize and compress one file, then write its archive and metrics."""
     validate_output_paths(args)
     lora = getattr(model, "lora_metadata", None)
@@ -62,7 +71,8 @@ def encode_archive(args, model, raw=None):
         progress=not args.no_progress, description="Encoding",
     )
     seconds = time.perf_counter() - started
-    return write_archive(args, model.schedule, raw, payload, len(symbols), seconds, lora)
+    return write_archive(args, model.schedule, raw, payload, len(symbols), seconds, lora,
+                         hypernetwork=personalized)
 
 
 def decode_archive(args, model, archive=None):

@@ -215,9 +215,11 @@ def add_model_arguments(encode, decode):
     decode.add_argument("--tokenizer", dest="tokenizer_path")
     for command in (encode, decode):
         command.add_argument("--lora_path", help="Local saved PEFT LoRA directory (optional)")
+        command.add_argument("--hypernetwork_path", help="HyperZip checkpoint directory (decode: optional relocation)")
         command.add_argument("--device", default="auto")
         command.add_argument("--trust_remote_code", action="store_true")
         command.add_argument("--local_files_only", action="store_true")
+    encode.add_argument("--context_embedding", help="Precomputed document embedding (.npy); requires --hypernetwork_path")
 
 
 def add_diffusion_arguments(parser):
@@ -272,6 +274,10 @@ def get_model_config(args, archive_header=None):
 
 
 def _validate_encode_args(args, parser):
+    if args.hypernetwork_path and args.lora_path:
+        parser.error("Choose --hypernetwork_path or --lora_path")
+    if args.context_embedding and not args.hypernetwork_path:
+        parser.error("--context_embedding requires --hypernetwork_path")
     if args.block_size < 1:
         parser.error("Coding block size must be positive")
     if not 1 <= args.frequency_precision <= 30:
