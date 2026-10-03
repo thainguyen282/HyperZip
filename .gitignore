@@ -221,6 +221,9 @@ __marimo__/
 /results/
 /adapters/
 /checkpoints/
+/data/
+/attempt/.automodel/
+/attempt/.venv*/
 *.partial
 
 tests/

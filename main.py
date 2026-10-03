@@ -101,14 +101,8 @@ def decode_archive(args, model, archive=None):
     }
 
 
-def main(argv=None):
-    """Parse arguments, run the program, and print its results."""
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+if __name__ == "__main__":
+    argv = None
     with logging_redirect_tqdm():
         results = run(parse_args(argv))
     print(json.dumps(results, indent=2))
-    return results
-
-
-if __name__ == "__main__":
-    main()
