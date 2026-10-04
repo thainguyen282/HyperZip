@@ -39,6 +39,8 @@ def run(args):
         logger.info("Loading %s: %s", config.model, config.model_path)
         model = load_model(config, expected_lora=(header or {}).get("lora"))
         if personalized:
+            from hypernetwork.runtime import finish
+            personalized = finish(personalized, config, model.model, model.tokenizer, raw=raw)
             resources.enter_context(attach(personalized, config, model.model))
         logger.info("Model settings: %s", json.dumps(asdict(config)))
         if args.command == "encode":
@@ -72,7 +74,7 @@ def encode_archive(args, model, raw=None, personalized=None):
     )
     seconds = time.perf_counter() - started
     return write_archive(args, model.schedule, raw, payload, len(symbols), seconds, lora,
-                         hypernetwork=personalized)
+                         hypernetwork=personalized, coding_stats=getattr(model, 'last_run_stats', {}))
 
 
 def decode_archive(args, model, archive=None):
@@ -93,16 +95,27 @@ def decode_archive(args, model, archive=None):
     verify_original(raw, metadata)
     write_decoded_file(args.output, raw)
     seconds = time.perf_counter() - started
-    return {
+    metrics = {
         "records": 1, "decoded_bytes": len(raw), "verified_decode": True,
         "decode_seconds": seconds,
         "decode_tokens_per_second": metadata["symbol_count"] / seconds if seconds > 0 else None,
         "decode_kb_per_second": len(raw) / 1000 / seconds if seconds > 0 else None,
+        **getattr(model, 'last_run_stats', {}),
     }
+    if header.get('model', {}).get('model') == 'nemotron':
+        size = header['model']['diffusion']['block_size']
+        blocks = (metadata['symbol_count'] + size - 1) // size
+        metrics['mean_refinement_passes_per_block'] = (
+            metrics.get('refinement_passes', 0) / blocks if blocks else None)
+    return metrics
 
 
-if __name__ == "__main__":
-    argv = None
+def main(argv=None):
     with logging_redirect_tqdm():
         results = run(parse_args(argv))
     print(json.dumps(results, indent=2))
+    return results
+
+
+if __name__ == "__main__":
+    main()
