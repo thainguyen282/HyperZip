@@ -1,5 +1,10 @@
-"""Train only the hypernetwork through a frozen Fast-dLLM backbone."""
-"""Usage: python -m hypernetwork.train --data <prepared_corpus> --output <output_dir> --model <backbone_model_path> [options]"""
+"""Hypernetwork training entrypoint; Nemotron delegates to NVIDIA's recipe."""
+if __package__ in (None, ""):
+    # Support both `python hypernetwork/train.py` and `python -m hypernetwork.train`.
+    import sys
+    from pathlib import Path as _Path
+    sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+    __package__ = "hypernetwork"
 import json
 import math
 from contextlib import contextmanager
@@ -14,7 +19,7 @@ from compression.model_loading import load_model
 from .checkpoint import save_checkpoint
 from .model import HyperConfig, HyperNetwork, generated_lora, target_spec
 
-from .train_config import parse_args
+from .train_config import load_nemotron_config
 
 
 @contextmanager
@@ -154,14 +159,14 @@ def train(args):
         objective='masked_block_clean_prefix_v1', learning_rate=args.learning_rate))
     (Path(args.output) / 'training.json').write_text(json.dumps(history, indent=2) + '\n')
 
+def main(argv=None):
+    from .nemotron import HypernetworkDiffusionLMSFTRecipe
+    cfg = load_nemotron_config(argv)
+    print(cfg, flush=True)
+    recipe = HypernetworkDiffusionLMSFTRecipe(cfg)
+    recipe.setup()
+    recipe.run_train_validation_loop()
+
+
 if __name__ == '__main__':
-    args = parse_args()
-    print(json.dumps(vars(args), indent=2), flush=True)
-    if args.nemotron and args.fastdllm:
-        raise ValueError('Cannot specify both --nemotron and --fastdllm')
-    if args.nemotron:
-        train_nemotron(args)
-    elif args.fastdllm:
-        train_fastdllm(args)
-    else:
-        train(args)
+    main()

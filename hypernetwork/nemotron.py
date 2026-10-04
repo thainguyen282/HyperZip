@@ -31,6 +31,10 @@ FORMAT = "nemotron_hypernetwork_recipe_v2"
 def read_documents(data_dir, sequence_length):
     root = Path(data_dir)
     metadata = json.loads((root / "metadata.json").read_text())
+    if metadata.get("format") == "nemotron_hypernetwork_arrow_v1":
+        from .fineweb_data import manifest
+        metadata, digest = manifest(data_dir, sequence_length)
+        return None, metadata, digest
     if (metadata.get("format") != "nemotron_hypernetwork_documents_v1" or
             metadata.get("model") != MODEL or metadata.get("model_revision") != REVISION or
             metadata.get("sequence_length") != sequence_length):
@@ -53,6 +57,9 @@ def load_documents(data_dir, split, seq_length=1024):
     """Adapt existing document JSONL to NeMo's unshifted dataset contract."""
     from datasets import Dataset
     rows, metadata, _ = read_documents(data_dir, seq_length)
+    if metadata.get("format") == "nemotron_hypernetwork_arrow_v1":
+        from .fineweb_data import load_arrow_documents
+        return load_arrow_documents(data_dir, split, seq_length)
     examples = []
     for row in rows[split]:
         ids = row["input_ids"]
@@ -212,13 +219,8 @@ class HypernetworkDiffusionLMSFTRecipe(DiffusionLMSFTRecipe):
         if not all(torch.isfinite(loss).all() for loss in kwargs["loss_buffer"]):
             raise RuntimeError("Nonfinite hybrid loss")
 
-
-def main():
+if __name__ == "__main__":
     cfg = parse_args_and_load_config()
     recipe = HypernetworkDiffusionLMSFTRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()
