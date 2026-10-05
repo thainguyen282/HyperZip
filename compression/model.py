@@ -25,6 +25,7 @@ class Model:
 
     def __init__(self, model, tokenizer, device):
         self.model, self.tokenizer, self.device = model.eval(), tokenizer, device
+        self.last_run_stats = {}
         self.bos = getattr(model.config, "bos_token_id", None)
         if self.bos is None:
             self.bos = tokenizer.bos_token_id
@@ -83,11 +84,13 @@ class Model:
             raise ValueError("Frequency precision must be between 1 and 30")
         symbols, vocabulary_size = [None] * count, None
         with closing(self.create_state(count, {"block_size": block_size})) as state:
-            groups = resolved_count = largest_group = 0
+            groups = resolved_count = largest_group = refinement_passes = 0
             with tqdm(total=count, desc=description, unit="symbol", disable=not progress) as bar:
                 while not state.done:
                     # Materialize the entire group before any source lookup or feedback.
                     predictions = list(self.next_predictions(state))
+                    if self.is_refinement_group(state):
+                        refinement_passes += 1
                     positions = [p.position for p in predictions]
                     if not positions:
                         raise ValueError("Session made no progress before completion")
@@ -128,7 +131,14 @@ class Model:
                     bar.update(group_size)
             if any(symbol is None for symbol in symbols):
                 raise ValueError("Session completed with unresolved positions")
+            self.last_run_stats = {"prediction_groups": groups,
+                                   "mean_tokens_per_group": resolved_count / groups if groups else None}
+            if isinstance(self, (FastDLLMModel, NemotronModel)):
+                self.last_run_stats['refinement_passes'] = refinement_passes
             return symbols
+
+    def is_refinement_group(self, state):
+        return False
 
     def create_state(self, symbol_count, settings):
         raise NotImplementedError("Implement create_state for this model")
@@ -292,6 +302,11 @@ class FastDLLMModel(DiffusionModel):
 
     schedule = "fast_dllm_bos_shifted_left_to_right_v1"
 
+    def is_refinement_group(self, state):
+        if self.cache_settings.use_kv_cache:
+            return state.kind == 'block'
+        return self.cache_settings.confidence_threshold is not None
+
     def __init__(self, model, tokenizer, device, settings=None):
         super().__init__(model, tokenizer, device)
         self.mask = FAST_DLLM_MASK_ID
@@ -334,6 +349,9 @@ class FastDLLMModel(DiffusionModel):
 
 class NemotronModel(DiffusionModel):
     """Same-position masked predictions and optional finalized causal prefix."""
+
+    def is_refinement_group(self, state):
+        return True
 
     def __init__(self, model, tokenizer, device, settings):
         super().__init__(model, tokenizer, device)

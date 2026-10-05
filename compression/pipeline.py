@@ -153,7 +153,8 @@ def _temporary(destination):
         path.unlink(missing_ok=True)
 
 
-def write_archive(args, schedule, raw, payload, token_count, seconds, lora=None, hypernetwork=None):
+def write_archive(args, schedule, raw, payload, token_count, seconds, lora=None, hypernetwork=None,
+                  coding_stats=None):
     """Publish a completed ZIP and separate metrics; never invoke a model."""
     validate_output_paths(args)
     if lora and hypernetwork:
@@ -196,6 +197,12 @@ def write_archive(args, schedule, raw, payload, token_count, seconds, lora=None,
             "compression_seconds": seconds,
             "tokens_per_second": token_count / seconds if seconds > 0 else None,
         }
+        metrics.update(coding_stats or {})
+        if args.model_config.model == 'nemotron':
+            size = args.model_config.diffusion.block_size
+            blocks = (token_count + size - 1) // size
+            metrics['mean_refinement_passes_per_block'] = (
+                metrics.get('refinement_passes', 0) / blocks if blocks else None)
         if hypernetwork:
             metrics['context_bytes'] = len(hypernetwork['context'])
             metrics['personalization_seconds'] = hypernetwork['personalization_seconds']

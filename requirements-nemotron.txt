@@ -8,3 +8,4 @@ tqdm==4.68.3
 safetensors==0.8.0
 tokenizers==0.22.2
 sentencepiece==0.2.1
+PyYAML==6.0.3

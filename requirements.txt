@@ -9,3 +9,4 @@ safetensors==0.5.3
 tqdm==4.67.1
 huggingface-hub==0.36.2
 einops==0.8.2
+PyYAML==6.0.3

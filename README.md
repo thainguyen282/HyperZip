@@ -38,12 +38,12 @@ loading is exercised by CPU tests in the default environment.
 ## Encode or decode independently
 
 ```bash
-python main.py encode \
+python main.py --step encode \
   --input examples/sample.txt --output results/text.bin \
   --metrics_output results/text.metrics.json \
   --model autoregressive --model_path HuggingFaceTB/SmolLM2-135M
 
-python main.py decode --input results/text.bin --output results/restored.txt
+python main.py --step decode --input results/text.bin --output results/restored.txt
 ```
 
 Add encode `--lora_path adapters/my_adapter` to use a saved adapter. Decode uses
@@ -62,7 +62,10 @@ operations; cross-device numerical equivalence is not guaranteed.
 ## Metrics
 
 Compression prints and saves the same JSON. `--metrics_output` defaults to
-`<output>.metrics.json`.
+`<output>.metrics.json`. For experiment inference, use one YAML file per run:
+`python main.py --config experiments/configs/ood/fineweb_validation__nemotron8b_base.yaml`.
+The [experiment guide](experiments/README.md) and [training plan](experiments/TRAINING_PLAN.md)
+keep checkpoint training separate from `main.py`.
 
 | Field | Definition |
 | --- | --- |
@@ -83,6 +86,9 @@ has a separate distribution cost; these metrics do not charge that cost.
 For the new hypernetwork format, the context vector is included in total size;
 shared hypernetwork weights remain external. Additional metrics report
 `context_bytes` and `personalization_seconds`.
+Experiment runs also report `prediction_groups` and mean tokens per group.
+Diffusion runs report observed `refinement_passes`; Nemotron also reports
+mean refinement passes per block. These measurements do not change refinement.
 Empty-input ratios are null. Decompression reports verified recovery and its own
 timing, including decoding, verification, and text output.
 
@@ -119,7 +125,7 @@ python -m unittest hypernetwork.tests -v
 
 The default CPU suite downloads no checkpoints. It covers arithmetic coding,
 model schedules and caches, UTF-8 round trips, corruption, output cleanup,
-metrics, and a tiny locally generated Llama/PEFT adapter. Run `main.py encode` and `main.py decode` directly to check a pretrained checkpoint.
+metrics, and a tiny locally generated Llama/PEFT adapter. Run `main.py --step encode` and `main.py --step decode` directly to check a pretrained checkpoint.
 
 ## Attribution
 
