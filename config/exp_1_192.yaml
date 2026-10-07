@@ -1,0 +1,97 @@
+# Hypernetwork-only smoke recipe. Uses pinned NeMo; one A100 80GB.
+recipe: HypernetworkDiffusionLMSFTRecipe
+seed: 42
+step_scheduler:
+  global_batch_size: 1
+  local_batch_size: 1
+  max_steps: 5
+  num_epochs: 1
+  ckpt_every_steps: 5
+  val_every_steps: 5
+  validate_on_checkpoint: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+model:
+  _target_: hypernetwork.nemotron.build_model
+  pretrained_model_name_or_path: nvidia/Nemotron-Labs-Diffusion-8B-Base
+  revision: 59ff0ffee284112fc6ccf37493ced41a11031434
+  trust_remote_code: true
+  data_dir: &data data/hypernetwork_fineweb_1367451
+  sequence_length: &length 1024
+  max_doc_tokens: 512
+  width: 64
+  depth: 2
+  rank: 8
+  alpha: 8
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/hypernetwork_recipe_smoke
+  model_save_format: safetensors
+  save_consolidated: false  # Composite hook saves hypernetwork only; base is pinned.
+  is_async: false
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: false  # Owned by the adapter forward/backward hook.
+  offload_policy: null
+  autocast_dtype: bfloat16
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+dllm:
+  mode: hybrid
+  mask_token_id: 100
+  eps: 0.001
+  block_size: null
+  half_life_ratio: null
+  ar_loss_alpha: 0.3
+  pad_block_size: 32
+  pad_seq_len_divisible: 1024
+  supervise_padding: false
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.98]
+  eps: 1.0e-5
+  weight_decay: 0.1
+  foreach: false
+clip_grad_norm:
+  max_norm: 1.0
+lr_scheduler:
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+
+dataset:
+  _target_: hypernetwork.nemotron.load_documents
+  data_dir: *data
+  split: train
+  seq_length: *length
+  tokenizer:
+    pretrained_model_name_or_path: nvidia/Nemotron-Labs-Diffusion-8B-Base
+    revision: 59ff0ffee284112fc6ccf37493ced41a11031434
+    trust_remote_code: true
+validation_dataset:
+  _target_: hypernetwork.nemotron.load_documents
+  data_dir: *data
+  split: validation
+  seq_length: *length
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 0
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+  num_workers: 0
+wandb:
+  enable: true
+  project: dllm-baseline
+  mode: offline
+  name: hypernetwork-recipe-smoke
+  group: hypernetwork-recipe
