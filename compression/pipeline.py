@@ -101,8 +101,9 @@ def read_archive(path):
                     or any(not isinstance(hypernetwork.get(key), str) or not hypernetwork[key]
                            for key in ('path', 'config_sha256', 'weights_sha256', 'context_sha256', 'adapter_sha256'))
                     or type(hypernetwork.get('embedding_dim')) is not int
-                    or not 0 < hypernetwork['embedding_dim'] <= 65536
-                    or hypernetwork.get('generator') != 'cpu_fp32_v1'):
+                    or hypernetwork.get('generator') not in ('cpu_fp32_v1', 'cpu_fp32_perceiver_v1')
+                    or not 0 < hypernetwork['embedding_dim'] <= (
+                        4_194_304 if hypernetwork.get('generator') == 'cpu_fp32_perceiver_v1' else 65536)):
                 raise ValueError('Invalid hypernetwork metadata')
             if archive.getinfo(CONTEXT_FILE).file_size != 4 * hypernetwork['embedding_dim']:
                 raise ValueError('Context vector size mismatch')
