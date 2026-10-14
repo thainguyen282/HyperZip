@@ -20,23 +20,27 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
 from transformers import AutoConfig
 
-from .model import HyperConfig, HyperNetwork, generated_lora, target_spec
+from .model import (HyperConfig, build_hypernetwork, capture_pre_layer_states,
+                    generated_lora, target_spec)
 
 MODEL = "nvidia/Nemotron-Labs-Diffusion-8B-Base"
 REVISION = "59ff0ffee284112fc6ccf37493ced41a11031434"
+MODEL_3B = "nvidia/Nemotron-Labs-Diffusion-3B-Base"
+REVISION_3B = "4bd78816ba988ca8b71b8f432b00b682572b236c"
+SUPPORTED_MODELS = {MODEL: REVISION, MODEL_3B: REVISION_3B}
 UPSTREAM = "20753eed182d7c2379987dc113d0793dda34b717"
 FORMAT = "nemotron_hypernetwork_recipe_v2"
 
 
-def read_documents(data_dir, sequence_length):
+def read_documents(data_dir, sequence_length, model=MODEL, revision=REVISION):
     root = Path(data_dir)
     metadata = json.loads((root / "metadata.json").read_text())
     if metadata.get("format") == "nemotron_hypernetwork_arrow_v1":
         from .fineweb_data import manifest
-        metadata, digest = manifest(data_dir, sequence_length)
+        metadata, digest = manifest(data_dir, sequence_length, model=model, revision=revision)
         return None, metadata, digest
     if (metadata.get("format") != "nemotron_hypernetwork_documents_v1" or
-            metadata.get("model") != MODEL or metadata.get("model_revision") != REVISION or
+            metadata.get("model") != model or metadata.get("model_revision") != revision or
             metadata.get("sequence_length") != sequence_length):
         raise ValueError("Dataset/model/tokenizer mismatch")
     if sequence_length < 1024 or sequence_length % 1024:
@@ -53,13 +57,13 @@ def read_documents(data_dir, sequence_length):
     return rows, metadata, digest
 
 
-def load_documents(data_dir, split, seq_length=1024):
+def load_documents(data_dir, split, seq_length=1024, model=MODEL, revision=REVISION):
     """Adapt existing document JSONL to NeMo's unshifted dataset contract."""
     from datasets import Dataset
-    rows, metadata, _ = read_documents(data_dir, seq_length)
+    rows, metadata, _ = read_documents(data_dir, seq_length, model, revision)
     if metadata.get("format") == "nemotron_hypernetwork_arrow_v1":
         from .fineweb_data import load_arrow_documents
-        return load_arrow_documents(data_dir, split, seq_length)
+        return load_arrow_documents(data_dir, split, seq_length, model, revision)
     examples = []
     for row in rows[split]:
         ids = row["input_ids"]
@@ -115,13 +119,22 @@ class HypernetworkModel(HFCheckpointingMixin, torch.nn.Module):
             raise RuntimeError("Missing AR branch: block_diff configuration is required")
         return result
 
-    def context(self, clean_ids, loss_mask):
+    def context(self, clean_ids, loss_mask, prepared_embedding=None):
         if clean_ids.shape[0] != 1:
             raise ValueError("Generated adapters require local_batch_size=1")
+        if self.contract.get('conditioning_model') == 'document_encoder':
+            if prepared_embedding is None or prepared_embedding.ndim != 2 or prepared_embedding.shape[0] != 1:
+                raise ValueError('Expected one prepared document-encoder vector')
+            return self.hypernetwork.project_embedding(prepared_embedding[0].float())
         # Dataset masks are contiguous; re-include the clean first token for conditioning.
         valid = loss_mask[0].bool().clone()
         valid[0] = True
         ids = clean_ids[0, valid][:self.contract["max_doc_tokens"]]
+        if self.hypernetwork.config.architecture == 'perceiver':
+            clean = ids.unsqueeze(0)
+            return capture_pre_layer_states(self.backbone, self.hypernetwork.spec, clean,
+                labels=clean, masked_indices=torch.zeros_like(clean, dtype=torch.bool),
+                skip_loss=True, use_cache=False)
         with torch.no_grad():
             return self.get_input_embeddings()(ids).float().mean(dim=0)
 
@@ -147,23 +160,62 @@ class HypernetworkModel(HFCheckpointingMixin, torch.nn.Module):
 
 def build_model(pretrained_model_name_or_path=MODEL, revision=REVISION, *, data_dir,
                 sequence_length=1024, max_doc_tokens=512, width=64, depth=2, rank=4, alpha=4,
-                seed=42, trust_remote_code=True):
-    if pretrained_model_name_or_path != MODEL or revision != REVISION or max_doc_tokens < 1:
-        raise ValueError("Use the pinned Nemotron model and positive conditioning length")
-    _, _, digest = read_documents(data_dir, sequence_length)
-    config = AutoConfig.from_pretrained(MODEL, revision=REVISION, trust_remote_code=trust_remote_code,
+                targets=('q_proj', 'v_proj'), architecture='mlp', seed=42, trust_remote_code=True,
+                conditioning_model='backbone_embeddings', embedding_model=None,
+                context_dim=None, projection='none', encoder_pooling=None,
+                encoder_max_length=None, expected_context_dim=None):
+    if SUPPORTED_MODELS.get(pretrained_model_name_or_path) != revision or max_doc_tokens < 1:
+        raise ValueError("Use a supported pinned Nemotron model and positive conditioning length")
+    if architecture == 'perceiver' and conditioning_model == 'backbone_embeddings':
+        conditioning_model = 'perceiver'  # Preserve the older architecture-only CLI.
+    _, metadata, digest = read_documents(data_dir, sequence_length, pretrained_model_name_or_path, revision)
+    if conditioning_model not in ('backbone_embeddings', 'document_encoder', 'perceiver'):
+        raise ValueError('Unsupported conditioning_model')
+    encoder = metadata.get('encoder')
+    if conditioning_model == 'document_encoder':
+        if (not isinstance(encoder, dict) or encoder.get('model_path') != embedding_model or
+                not isinstance(encoder.get('embedding_dim'), int)):
+            raise ValueError('Prepared encoder does not match the configured embedding model')
+        if (encoder_pooling is not None and encoder.get('pooling') != f'{encoder_pooling}_l2_v1') or (
+                encoder_max_length is not None and encoder.get('max_length') != encoder_max_length):
+            raise ValueError('Prepared encoder pooling or input limit differs from the configuration')
+        native_dim = encoder['embedding_dim']
+        if context_dim is None:
+            context_dim = native_dim
+        if not 1 <= context_dim <= native_dim:
+            raise ValueError('Invalid document context width')
+        if projection == 'none' and context_dim != native_dim:
+            raise ValueError('Reduced document context requires a projection')
+    elif (encoder is not None or embedding_model is not None or context_dim is not None or
+          projection != 'none' or encoder_pooling is not None or encoder_max_length is not None):
+        raise ValueError('Backbone/Perceiver conditioning requires unembedded prepared data')
+    if (conditioning_model == 'perceiver') != (architecture == 'perceiver'):
+        raise ValueError('Perceiver conditioning requires the Perceiver architecture')
+    config = AutoConfig.from_pretrained(pretrained_model_name_or_path, revision=revision, trust_remote_code=trust_remote_code,
                                        dlm_paradigm="block_diff", block_size=32)
     config.use_cache = False
-    base = NeMoAutoModelForCausalLM.from_pretrained(MODEL, revision=REVISION, config=config,
+    base = NeMoAutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, revision=revision, config=config,
         trust_remote_code=trust_remote_code, torch_dtype=torch.bfloat16).eval().requires_grad_(False)
-    spec = target_spec(base)
-    hyper_config = HyperConfig(embedding_dim=base.get_input_embeddings().embedding_dim,
-                              hidden_dim=width, depth=depth, rank=rank, alpha=alpha)
-    hyper = HyperNetwork(hyper_config, spec)
-    contract = dict(model=MODEL, revision=REVISION, upstream=UPSTREAM, data_sha256=digest,
+    spec = target_spec(base, tuple(targets))
+    hyper_config = HyperConfig(embedding_dim=(context_dim if conditioning_model == 'document_encoder'
+                                              else base.get_input_embeddings().embedding_dim),
+                              hidden_dim=width, depth=depth, rank=rank, alpha=alpha,
+                              architecture=architecture,
+                              native_embedding_dim=(native_dim if conditioning_model == 'document_encoder'
+                                                    and projection != 'none' else None),
+                              projection=projection)
+    hyper = build_hypernetwork(hyper_config, spec)
+    if expected_context_dim is not None and hyper.context_dim != expected_context_dim:
+        raise ValueError(f'Configured context width {expected_context_dim} differs from {hyper.context_dim}')
+    contract = dict(model=pretrained_model_name_or_path, revision=revision, upstream=UPSTREAM, data_sha256=digest,
                     hypernetwork=asdict(hyper_config), targets=spec, sequence_length=sequence_length,
-                    max_doc_tokens=max_doc_tokens, seed=seed, context="frozen_token_embedding_mean_v1",
+                    max_doc_tokens=max_doc_tokens, seed=seed,
+                    context=('frozen_pre_layer_hidden_states_perceiver_v1' if architecture == 'perceiver'
+                             else 'prepared_document_encoder_v1' if conditioning_model == 'document_encoder'
+                             else 'frozen_token_embedding_mean_v1'),
                     objective="native_nemotron_hybrid_alpha_0.3")
+    if conditioning_model == 'document_encoder':
+        contract.update(conditioning_model=conditioning_model, encoder=encoder)
     return HypernetworkModel(base, hyper, contract)
 
 
@@ -187,7 +239,9 @@ class HypernetworkDiffusionLMSFTRecipe(DiffusionLMSFTRecipe):
         # The model and both dataset factories must describe the same prepared corpus.
         for name in ("dataset", "validation_dataset"):
             if (Path(self.cfg.get(f"{name}.data_dir")).resolve() != Path(self.cfg.model.data_dir).resolve() or
-                    self.cfg.get(f"{name}.seq_length") != self.cfg.model.sequence_length):
+                    self.cfg.get(f"{name}.seq_length") != self.cfg.model.sequence_length or
+                    self.cfg.get(f"{name}.model", MODEL) != self.cfg.model.pretrained_model_name_or_path or
+                    self.cfg.get(f"{name}.revision", REVISION) != self.cfg.model.revision):
                 raise ValueError("Model and dataset preparation settings disagree")
         self.cfg.model.seed = self.cfg.get("seed", 42)
         super().setup()
@@ -211,7 +265,9 @@ class HypernetworkDiffusionLMSFTRecipe(DiffusionLMSFTRecipe):
     def _forward_backward_step(self, idx, batch, **kwargs):
         model = self.model_parts[0]
         clean = batch.get("_clean_input_ids", batch["input_ids"]).to(self.dist_env.device)
-        context = model.context(clean, batch["loss_mask"].to(self.dist_env.device))
+        context = model.context(clean, batch["loss_mask"].to(self.dist_env.device),
+                                batch.get('context_embedding').to(self.dist_env.device)
+                                if 'context_embedding' in batch else None)
         factors = model.hypernetwork(context)
         config = model.hypernetwork.config
         with checkpoint_layers(model.backbone), generated_lora(model.backbone, factors, config.alpha, config.rank):

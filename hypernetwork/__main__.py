@@ -16,9 +16,22 @@ def prepare(args):
         trust_remote_code=args.trust_remote_code, local_files_only=args.local_files_only)
     device = args.device if args.device != 'auto' else ('cuda' if torch.cuda.is_available() else 'cpu')
     dtype = args.dtype if args.dtype != 'auto' else ('bfloat16' if device.startswith('cuda') else 'float32')
-    encoder = DocumentEncoder(args.embedding_model, revision=args.encoder_revision,
-        max_length=args.encoder_max_length, device=device, dtype=dtype,
-        trust_remote_code=args.trust_remote_code, local_files_only=args.local_files_only)
+    if args.conditioning_model == 'backbone_hidden_states':
+        if args.context_dim is not None:
+            raise ValueError('context_dim does not apply to backbone hidden states')
+        encoder = None
+        encoder_metadata = dict(pooling='backbone_pre_layer_hidden_states_perceiver_v1')
+    else:
+        encoder = DocumentEncoder(args.embedding_model, revision=args.encoder_revision,
+            max_length=args.encoder_max_length, device=device, dtype=dtype,
+            trust_remote_code=args.trust_remote_code, local_files_only=args.local_files_only)
+        native_dim = encoder.metadata['embedding_dim']
+        context_dim = native_dim if args.context_dim is None else args.context_dim
+        if not 1 <= context_dim <= native_dim:
+            raise ValueError('context_dim must be between 1 and the encoder width')
+        encoder.metadata.update(native_embedding_dim=native_dim, embedding_dim=context_dim,
+                                projection='learned_linear_l2_v1')
+        encoder_metadata = encoder.metadata
     root.mkdir(parents=True)
     count = 0
     with (root / 'documents.jsonl').open('x', encoding='utf-8') as output:
@@ -39,7 +52,9 @@ def prepare(args):
                 ids = tokenizer.encode(text, add_special_tokens=False)
                 if not ids:
                     continue
-                item = dict(input_ids=ids, embedding=encoder.encode(text).tolist())
+                item = dict(input_ids=ids)
+                if encoder is not None:
+                    item['embedding'] = encoder.encode(text).tolist()
                 output.write(json.dumps(item) + '\n')
                 count += 1
                 if count % 100 == 0:
@@ -47,7 +62,7 @@ def prepare(args):
     if count == 0:
         raise ValueError('Corpus contains no nonempty documents')
     (root / 'metadata.json').write_text(json.dumps(dict(format='hyperzip_training_data_v1',
-        tokenizer_path=model_path, tokenizer_revision=args.revision, encoder=encoder.metadata,
+        tokenizer_path=model_path, tokenizer_revision=args.revision, encoder=encoder_metadata,
         documents=count), indent=2) + '\n', encoding='utf-8')
     print(json.dumps({'prepared_documents': count, 'output': str(root)}))
 
@@ -57,7 +72,7 @@ def export(args):
     from .checkpoint import load_checkpoint, export_adapter, embedding_bytes, read_embedding
     network, metadata, _ = load_checkpoint(args.checkpoint)
     context = read_embedding(embedding_bytes(np.load(args.context_embedding, allow_pickle=False)),
-                             network.config.embedding_dim)
+                             network.context_dim)
     export_adapter(args.output, network, context, metadata['backbone']['model_path'])
 
 
@@ -73,6 +88,10 @@ def main(argv=None):
     prep.add_argument('--embedding_model', default='Alibaba-NLP/gte-Qwen2-1.5B-instruct')
     prep.add_argument('--encoder_revision')
     prep.add_argument('--encoder_max_length', type=int, default=32000)
+    prep.add_argument('--conditioning_model', choices=('text_encoder', 'backbone_hidden_states'),
+                      default='text_encoder', help='Use token IDs only for Perceiver conditioning')
+    prep.add_argument('--context_dim', type=int,
+                      help='Archived context width (default: encoder native width; linear projection is automatic)')
     training = commands.add_parser('train', help='Train a Fast-dLLM hypernetwork on prepared documents')
     training.add_argument('--data', required=True)
     training.add_argument('--model_path', required=True)
@@ -81,11 +100,16 @@ def main(argv=None):
     training.add_argument('--gradient_accumulation', type=int, default=128)
     training.add_argument('--learning_rate', type=float, default=2e-5)
     training.add_argument('--sequence_length', type=int, default=8192)
+    training.add_argument('--max_doc_tokens', type=int, default=512,
+                          help='Clean backbone tokens for Perceiver conditioning')
     training.add_argument('--block_size', type=int, default=256)
     training.add_argument('--hidden_dim', type=int, default=1280)
     training.add_argument('--depth', type=int, default=2)
     training.add_argument('--rank', type=int, default=8)
     training.add_argument('--alpha', type=float, default=8)
+    training.add_argument('--targets', nargs='+', default=['q_proj', 'v_proj'])
+    training.add_argument('--architecture', choices=('mlp', 'mlp_s', 'mlp_m', 'mlp_l',
+                                                    'residual_mlp', 'attention', 'perceiver'), default='mlp')
     training.add_argument('--seed', type=int, default=0)
     training.add_argument('--no_gradient_checkpointing', action='store_true')
     for sub in (prep, training):

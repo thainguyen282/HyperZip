@@ -42,7 +42,8 @@ def load_nemotron_config(argv=None):
     parser.add_argument("-c", "--config", default=str(DEFAULT_NEMOTRON_CONFIG))
     parser.add_argument("--nemotron", action="store_true", help="Compatibility alias; Nemotron is the default")
     parser.add_argument("--fastdllm", action="store_true", help="Unsupported by this NeMo entrypoint")
-    parser.add_argument("--architecture", choices=["mlp"], default="mlp",
+    parser.add_argument("--architecture", choices=["mlp", "mlp_s", "mlp_m", "mlp_l",
+                                                   "residual_mlp", "attention", "perceiver"],
                         help="Hypernetwork generator architecture currently implemented")
     parser.add_argument("--data", help="Prepared dataset for model, train, and validation")
     parser.add_argument("--output", help="Native checkpoint output directory")
@@ -52,6 +53,7 @@ def load_nemotron_config(argv=None):
     parser.add_argument("--depth", type=int, help="MLP hidden layers")
     parser.add_argument("--rank", type=int, help="Generated LoRA rank")
     parser.add_argument("--alpha", type=float, help="Generated LoRA scale")
+    parser.add_argument("--targets", nargs="+", help="Projection names to adapt (default: q_proj v_proj)")
     parser.add_argument("--max-doc-tokens", type=int, help="Real conditioning tokens")
     parser.add_argument("--global-batch-size", type=int, help="Documents per update")
     parser.add_argument("--lr", type=float, help="AdamW learning rate")
@@ -79,6 +81,9 @@ def load_nemotron_config(argv=None):
     add("checkpoint.restore_from", args.resume)
     for name in ("width", "depth", "rank", "alpha", "max_doc_tokens"):
         add(f"model.{name}", getattr(args, name))
+    if args.targets:
+        add("model.targets", "[" + ",".join(args.targets) + "]")
+    add("model.architecture", args.architecture)
     add("step_scheduler.global_batch_size", args.global_batch_size)
     add("optimizer.lr", args.lr)
     add("seed", args.seed)

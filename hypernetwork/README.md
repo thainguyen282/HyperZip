@@ -85,7 +85,7 @@ training and the paper's resulting quality have not been reproduced.
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-./.venv/bin/python main.py encode \
+./.venv/bin/python main.py --step encode \
   --input datasets/enwiki8_partial.txt \
   --output results/enwiki8_partial_hyperzip.bin \
   --model fast_dllm \
@@ -118,7 +118,7 @@ alone; it does not establish end-to-end throughput.
 ## 4. Decode without the original text or encoder
 
 ```bash
-./.venv/bin/python main.py decode \
+./.venv/bin/python main.py --step decode \
   --input results/enwiki8_partial_hyperzip.bin \
   --output results/enwiki8_partial_hyperzip.restored.txt \
   --device cuda --trust_remote_code --local_files_only
@@ -140,6 +140,90 @@ Incompatible historical runtime-personalization archives remain unsupported.
 Use the result with `--lora_path adapters/document`. That existing workflow needs
 the exported adapter at decode time and excludes its size from archive metrics.
 
+## Ablation controls
+
+See [ABLATION_PLAN.md](ABLATION_PLAN.md) for the study design and reporting
+requirements. The supported controls are:
+
+* `prepare --encoder_max_length N --embedding_model MODEL --context_dim D`:
+  prepare a fresh corpus for each embedding input cap, model, or archived context
+  width. A trainable linear layer maps the native encoder width to `D`, followed
+  by L2 normalization. It trains with the hypernetwork. `--context_dim` is
+  optional; without it, `D` is the encoder's native width and the linear layer
+  is still used.
+  The encoder's native width and projection are recorded in corpus metadata.
+* Fast-dLLM `train --architecture mlp|residual_mlp|attention|perceiver --targets q_proj v_proj ...`:
+  select generator and LoRA projections. Rank, alpha, hidden width, and depth
+  remain separately configurable. Use a fresh checkpoint for every variant.
+* Nemotron `hypernetwork/train.py --architecture perceiver --targets q_proj
+  k_proj v_proj o_proj` supports the same generator and target-module choices,
+  alongside `--max-doc-tokens`, `--width`, `--depth`, `--rank`, and `--alpha`.
+
+For a Fast-dLLM Perceiver run, prepare token IDs without a separate encoder:
+
+```bash
+.venv/bin/python -m hypernetwork prepare --input datasets/train.jsonl \
+  --output datasets/perceiver_prepared --tokenizer_path /path/to/backbone \
+  --conditioning_model backbone_hidden_states
+.venv/bin/python -m hypernetwork train --data datasets/perceiver_prepared \
+  --model_path /path/to/backbone --output checkpoints/perceiver_trial \
+  --architecture perceiver --max_doc_tokens 512
+```
+
+This follows the [Doc-to-LoRA Perceiver design](https://arxiv.org/html/2602.15902):
+the frozen backbone first reads clean document tokens; learned rank-sized
+queries cross-attend to the activations entering each adapted layer. Separate
+heads map each latent to a row of A and a column of B. The number of
+cross-attention passes is `--depth`. This project retains its existing
+compression/training objectives and Q/V defaults; it does not implement the
+paper's context-distillation loss or long-context chunk composition.
+
+The archive stores the fixed-size Perceiver latents, not the full token hidden
+states. Their FP32 size is `layers × rank × hidden_dim × 4` bytes, which may be
+substantially larger than a pooled embedding. Encoding runs an extra clean
+backbone pass to construct them; decoding regenerates adapters directly from
+the stored latents. The normal size metrics include this context overhead.
+
+Keep alpha proportional to rank in rank sweeps. Projection names must match
+linear modules in every backbone layer; invalid sets fail before training.
+For vector-conditioned runs, preparation stores native encoder vectors so
+training can update the linear map. At encode time the trained map produces the
+compact FP32 vector stored in the archive. A supplied `--context_embedding`
+must already have the archived width, whether it contains a projected vector
+or Perceiver latents. Prepared contexts must be regenerated after any
+embedding-side change. The
+checkpoint stores the target layout and generator configuration for exact
+reload; inference checks the backbone layout before attaching adapters.
+Older checkpoints that used fixed pooling remain readable.
+
+Generate the one-factor Nemotron matrix with separate checkpoints and seeds:
+
+```bash
+attempt/.automodel/.venv/bin/python -m hypernetwork.ablation_matrix \
+  --data data/hypernetwork_fineweb_1367451 \
+  --output results/nemotron_ablation_matrix --steps 5000
+```
+
+This writes a `manifest.json` with the exact commands. Add `--execute` inside
+an appropriate GPU allocation to run them sequentially. The matrix covers
+conditioning length, width, depth, rank, generator architecture, and target
+modules; it holds alpha/rank at one. Each variant is compared with the baseline
+at the same seed. A larger prepared corpus is needed for meaningful results.
+
+After complete encode/decode runs, write one JSONL measurement per file and
+variant with `variant`, `seed`, `file_id`, `input_tokens`, `input_bytes`,
+`archive_bytes`, `context_bytes`, `encode_seconds`, `decode_seconds`, and
+`roundtrip_ok`. Summarize with:
+
+```bash
+.venv/bin/python -m hypernetwork.ablation_report measurements.jsonl \
+  --baseline baseline --output results/ablation_report.json
+```
+
+The report rejects failed round trips, duplicate rows, and mismatched held-out
+files. It includes size bins by input tokens, aggregate bits per byte, context
+overhead, times, and paired differences from the baseline for each seed.
+
 ## Tests
 
 ```bash
@@ -152,6 +236,53 @@ exact PEFT export equivalence, corruption rejection, and round trips after
 deleting the source and moving the checkpoint. No pretrained downloads are needed.
 
 ## Nemotron hypernetwork recipe / FineWeb smoke test
+
+### Clean Nemotron Labs Diffusion 3B Base experiment
+
+The separate `attempt/hypernetwork_nemotron_3b.yaml` pins the original
+`nvidia/Nemotron-Labs-Diffusion-3B-Base` weights at revision
+`4bd78816ba988ca8b71b8f432b00b682572b236c`. It starts with a new
+hypernetwork; it does not restore an 8B checkpoint. From the repository root,
+prepare a separate FineWeb sample with the 3B tokenizer:
+
+```bash
+attempt/.automodel/.venv/bin/python attempt/prepare_fineweb_hypernetwork.py \
+  --model nvidia/Nemotron-Labs-Diffusion-3B-Base \
+  --revision 4bd78816ba988ca8b71b8f432b00b682572b236c \
+  --output data/hypernetwork_fineweb_3b_smoke
+```
+
+Then run five optimizer updates inside a one-GPU allocation:
+
+```bash
+attempt/.automodel/.venv/bin/python hypernetwork/train.py \
+  -c attempt/hypernetwork_nemotron_3b.yaml \
+  --output checkpoints/hypernetwork_3b_smoke --steps 5
+```
+
+Use a fresh output path for each experiment. The prepared 8B corpus cannot be
+reused because token IDs and metadata are pinned to the 8B tokenizer. This 3B
+configuration has passed CPU syntax/config checks and static inspection of the
+cached 3B model; a 3B GPU training smoke run has not yet been performed.
+
+For the full 900M-training-token / 1M-validation-token FineWeb run, use the
+separate 3B preparation and training Slurm scripts. They prepare new token IDs
+with the pinned 3B tokenizer, verify the manifest, and start one epoch only
+after preparation succeeds:
+
+```bash
+mkdir -p results/hypernetwork-nemotron
+prep_job=$(sbatch --parsable attempt/prepare_hypernetwork_3b_900m.sbatch)
+sbatch --dependency=afterok:"$prep_job" --kill-on-invalid-dep=yes \
+  attempt/train_hypernetwork_3b_900m.sbatch
+```
+
+The full config is `attempt/hypernetwork_fineweb_3b_900m.yaml`; prepared data
+goes to `data/hypernetwork_fineweb_3b_900m/`, with native checkpoints under
+`checkpoints/hypernetwork_3b_900m_JOB_ID/`. The 72-hour GPU allocation may
+end before the one epoch completes. Inspect `run-status.json` after it exits;
+`partial_checkpoint_saved` means a new allocation must resume from the reported
+checkpoint path. This 3B full run has not been submitted or GPU validated.
 
 `HypernetworkDiffusionLMSFTRecipe` in `hypernetwork.nemotron` subclasses NVIDIA's
 `DiffusionLMSFTRecipe`. NVIDIA owns the training loop, corruption, hybrid loss,

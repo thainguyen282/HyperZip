@@ -16,12 +16,12 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def manifest(data_dir, sequence_length, verify_files=False):
+def manifest(data_dir, sequence_length, verify_files=False, model=MODEL, revision=REVISION):
     root = Path(data_dir)
     raw = (root / 'metadata.json').read_bytes()
     metadata = json.loads(raw)
-    if (metadata.get('format') != FORMAT or metadata.get('model') != MODEL or
-            metadata.get('model_revision') != REVISION or metadata.get('sequence_length') != sequence_length):
+    if (metadata.get('format') != FORMAT or metadata.get('model') != model or
+            metadata.get('model_revision') != revision or metadata.get('sequence_length') != sequence_length):
         raise ValueError('Dataset/model/tokenizer mismatch')
     for split in ('train', 'validation'):
         stats = metadata['splits'][split]
@@ -36,10 +36,15 @@ def manifest(data_dir, sequence_length, verify_files=False):
     return metadata, hashlib.sha256(raw).hexdigest()
 
 
-def load_arrow_documents(data_dir, split, seq_length=1024):
+def load_arrow_documents(data_dir, split, seq_length=1024, model=MODEL, revision=REVISION):
     from datasets import load_from_disk
-    metadata, _ = manifest(data_dir, seq_length)
+    metadata, _ = manifest(data_dir, seq_length, model=model, revision=revision)
     dataset = load_from_disk(str(Path(data_dir) / split), keep_in_memory=False)
     if len(dataset) != metadata['splits'][split]['documents']:
         raise ValueError('Dataset row count does not match manifest')
-    return dataset.select_columns(['input_ids', 'loss_mask', 'attention_mask'])
+    columns = ['input_ids', 'loss_mask', 'attention_mask']
+    if metadata.get('encoder') is not None:
+        if 'context_embedding' not in dataset.column_names:
+            raise ValueError('Prepared encoder vectors are missing')
+        columns.append('context_embedding')
+    return dataset.select_columns(columns)

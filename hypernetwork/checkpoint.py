@@ -8,9 +8,10 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from compression.lora import _file_sha256
-from .model import HyperConfig, HyperNetwork, target_spec
+from .model import HyperConfig, build_hypernetwork, target_spec
 
 FORMAT = 'hyperzip_hypernetwork_v1'
+NEMOTRON_FORMAT = 'nemotron_hypernetwork_recipe_v2'
 
 
 def save_checkpoint(path, network, *, backbone, encoder, training=None):
@@ -25,12 +26,27 @@ def save_checkpoint(path, network, *, backbone, encoder, training=None):
 
 def inspect_checkpoint(path, expected=None):
     root = Path(path).resolve()
-    identity = dict(path=str(root), config_sha256=_file_sha256(root / 'config.json'),
-                    weights_sha256=_file_sha256(root / 'hypernetwork.safetensors'))
+    recipe = (root / 'model/hypernetwork_config.json').is_file()
+    config_path = root / ('model/hypernetwork_config.json' if recipe else 'config.json')
+    weights_path = root / ('model/hypernetwork.safetensors' if recipe else 'hypernetwork.safetensors')
+    identity = dict(path=str(root), config_sha256=_file_sha256(config_path),
+                    weights_sha256=_file_sha256(weights_path))
     if expected and any(identity[k] != expected.get(k) for k in ('config_sha256', 'weights_sha256')):
         raise ValueError('Hypernetwork checkpoint checksum mismatch')
-    metadata = json.loads((root / 'config.json').read_text(encoding='utf-8'))
-    if metadata.get('format') != FORMAT:
+    metadata = json.loads(config_path.read_text(encoding='utf-8'))
+    if recipe and metadata.get('format') == NEMOTRON_FORMAT:
+        contract = metadata['contract']
+        if contract.get('context') not in ('frozen_token_embedding_mean_v1',
+                                           'frozen_pre_layer_hidden_states_perceiver_v1'):
+            raise ValueError('Unsupported Nemotron conditioning')
+        metadata = dict(format=NEMOTRON_FORMAT, config=contract['hypernetwork'],
+                        targets=contract['targets'],
+                        backbone=dict(model='nemotron', model_path=contract['model'],
+                                      revision=contract['revision']),
+                        encoder=dict(pooling=contract['context'],
+                                     max_length=contract['max_doc_tokens']),
+                        training=dict(contract=contract))
+    elif metadata.get('format') != FORMAT:
         raise ValueError('Unsupported hypernetwork checkpoint format')
     HyperConfig(**metadata['config'])
     return identity, metadata
@@ -38,8 +54,10 @@ def inspect_checkpoint(path, expected=None):
 
 def load_checkpoint(path, expected=None):
     identity, metadata = inspect_checkpoint(path, expected)
-    network = HyperNetwork(HyperConfig(**metadata['config']), metadata['targets'])
-    network.load_state_dict(load_file(str(Path(path) / 'hypernetwork.safetensors')), strict=True)
+    network = build_hypernetwork(HyperConfig(**metadata['config']), metadata['targets'])
+    weights = Path(path) / ('model/hypernetwork.safetensors' if metadata['format'] == NEMOTRON_FORMAT
+                            else 'hypernetwork.safetensors')
+    network.load_state_dict(load_file(str(weights)), strict=True)
     if any(not torch.isfinite(p).all() for p in network.parameters()):
         raise ValueError('Hypernetwork checkpoint contains nonfinite weights')
     inspect_checkpoint(path, identity)
@@ -87,7 +105,7 @@ def validate_backbone(metadata, config, model=None):
         raise ValueError('Hypernetwork was trained for a different backbone')
     if expected.get('revision') is not None and config.revision != expected['revision']:
         raise ValueError('Hypernetwork backbone revision mismatch')
-    if model is not None and target_spec(model) != metadata['targets']:
+    if model is not None and target_spec(model, tuple(sorted({s['module'] for s in metadata['targets']}))) != metadata['targets']:
         raise ValueError('Hypernetwork target projection layout mismatch')
 
 
