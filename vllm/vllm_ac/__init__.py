@@ -14,3 +14,12 @@ def register():
 
     manager.register("TeacherForcedScoring", TeacherForcedScoring)
     manager.apply_patch("TeacherForcedScoring")
+
+    from .autoregressive import install as install_compression
+
+    install_compression()
+
+    if os.getenv("VLLM_AC_ENABLE") == "1":
+        from .worker import install
+
+        install()
