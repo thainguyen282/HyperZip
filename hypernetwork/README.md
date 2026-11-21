@@ -1,5 +1,11 @@
 # HyperZip hypernetwork
 
+## Selected embedding configuration
+
+The selected configuration for the embedding experiment is **GTE-Qwen2-1.5B-instruct + learned linear projection to a 512-dimensional context vector**. The encoder produces 1,536 native dimensions; the projection is trained with the hypernetwork. Its Nemotron 3B training configuration is [`gte_qwen2_1_5b_linear_512.yaml`](../experiments/embedding_context_3b/gte_qwen2_1_5b_linear_512.yaml), and its row-specific launcher and the other table rows are in [`scripts/embedding_exp`](scripts/embedding_exp/README.md). This is an experiment selection, not a change to every legacy CLI default.
+
+Native Nemotron document-encoder checkpoints can be used by the compression runtime. See the experiment instructions for data preparation, training, evaluation, and hardware requirements.
+
 Document-conditioned LoRA generation and context-vector archives following
 [HyperZip, §3 and Appendix C](https://arxiv.org/html/2609.36357v1).
 The document encoder defaults to GTE-Qwen2-1.5B-Instruct (1536 dimensions,
@@ -339,8 +345,8 @@ Checkpoint directories contain `model/hypernetwork.safetensors` and
 `model/hypernetwork_config.json`, plus native optimizer, scheduler, dataloader,
 and RNG state. The backbone is referenced by its pinned revision, not copied.
 The conditioning/model/data contract must match when restoring. Legacy custom
-loop checkpoints are not resumable by this recipe, and this checkpoint format
-is not yet integrated into the compression runtime.
+loop checkpoints are not resumable by this recipe. Native recipe checkpoints
+can be loaded by the compression runtime when their conditioning is supported.
 
 Submit the complete acceptance workflow:
 
@@ -521,3 +527,9 @@ a meaningful quality improvement or reproduction of paper results.
 The final checkpoint and summary are in
 `checkpoints/hypernetwork_nemotron_1367451/train/`; the complete batch log is
 `results/hypernetwork-nemotron/slurm-1367451.log`. W&B logs were saved offline.
+
+## Shared 3B and 8B hypernetwork experiment
+
+The [multi-model experiment](scripts/multimodel_exp/README.md) trains one
+model-identity-conditioned generator on paired Nemotron 3B and 8B visits for
+each FineWeb document and exports a document-specific adapter for either model.

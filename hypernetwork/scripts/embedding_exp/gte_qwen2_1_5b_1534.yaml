@@ -1,0 +1,116 @@
+# Full 900M-token Nemotron 3B hypernetwork experiment.
+recipe: HypernetworkDiffusionLMSFTRecipe
+seed: 42
+step_scheduler:
+  global_batch_size: 1
+  local_batch_size: 1
+  max_steps: null
+  num_epochs: 1
+  ckpt_every_steps: 500
+  val_every_steps: null
+  validate_on_checkpoint: false
+  preemption_signal:
+  - SIGUSR1
+  - SIGTERM
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+model:
+  _target_: hypernetwork.nemotron.build_model
+  pretrained_model_name_or_path: nvidia/Nemotron-Labs-Diffusion-3B-Base
+  revision: 4bd78816ba988ca8b71b8f432b00b682572b236c
+  trust_remote_code: true
+  data_dir: data/hypernetwork_fineweb_3b_900m_gte_qwen2_1_5b_instruct
+  sequence_length: 1024
+  max_doc_tokens: 512
+  architecture: mlp
+  width: 64
+  depth: 2
+  rank: 4
+  alpha: 4
+  targets:
+  - q_proj
+  - v_proj
+  conditioning_model: document_encoder
+  embedding_model: Alibaba-NLP/gte-Qwen2-1.5B-instruct
+  context_dim: 1534
+  projection: truncate_l2
+  encoder_pooling: last_token
+  encoder_max_length: 1024
+  expected_context_dim: 1534
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/hypernetwork_3b_gte_qwen2_1_5b_1534
+  max_recent_checkpoints: 3
+  model_save_format: safetensors
+  save_consolidated: false
+  is_async: false
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: false
+  offload_policy: null
+  autocast_dtype: bfloat16
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+dllm:
+  mode: hybrid
+  mask_token_id: 100
+  eps: 0.001
+  block_size: null
+  half_life_ratio: null
+  ar_loss_alpha: 0.3
+  pad_block_size: 32
+  pad_seq_len_divisible: 1024
+  supervise_padding: false
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.0001
+  betas:
+  - 0.9
+  - 0.98
+  eps: 1.0e-05
+  weight_decay: 0.1
+  foreach: false
+clip_grad_norm:
+  max_norm: 1.0
+lr_scheduler:
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+dataset:
+  _target_: hypernetwork.nemotron.load_documents
+  data_dir: data/hypernetwork_fineweb_3b_900m_gte_qwen2_1_5b_instruct
+  split: train
+  model: nvidia/Nemotron-Labs-Diffusion-3B-Base
+  revision: 4bd78816ba988ca8b71b8f432b00b682572b236c
+  seq_length: 1024
+  tokenizer:
+    pretrained_model_name_or_path: nvidia/Nemotron-Labs-Diffusion-3B-Base
+    revision: 4bd78816ba988ca8b71b8f432b00b682572b236c
+    trust_remote_code: true
+validation_dataset:
+  _target_: hypernetwork.nemotron.load_documents
+  data_dir: data/hypernetwork_fineweb_3b_900m_gte_qwen2_1_5b_instruct
+  split: validation
+  model: nvidia/Nemotron-Labs-Diffusion-3B-Base
+  revision: 4bd78816ba988ca8b71b8f432b00b682572b236c
+  seq_length: 1024
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 0
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+  num_workers: 0
+wandb:
+  enable: true
+  project: dllm-baseline
+  mode: offline
+  name: hypernetwork-3b-gte_qwen2_1_5b_1536
+  group: hypernetwork-3b-embedding-context

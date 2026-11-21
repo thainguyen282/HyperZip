@@ -26,6 +26,34 @@ def prepare(args, config, *, raw=None, archive=None):
     # Configure deterministic CUDA before either model creates a CUDA handle.
     configure_runtime(config)
     network, metadata, identity = load_checkpoint(path, saved)
+    if (metadata['format'] == NEMOTRON_FORMAT and
+            metadata['training']['contract']['context'] == 'prepared_document_encoder_v1'):
+        if archive:
+            context_data = archive.context
+        elif args.context_embedding:
+            context_data = embedding_bytes(np.load(args.context_embedding, allow_pickle=False))
+        else:
+            settings = metadata['encoder']
+            pooling = settings['pooling'].removesuffix('_l2_v1')
+            device = config.device
+            if device == 'auto':
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            dtype = config.dtype if config.dtype != 'auto' else ('bfloat16' if device.startswith('cuda') else 'float32')
+            encoder = DocumentEncoder(settings['model_path'], revision=settings.get('revision'),
+                max_length=settings['max_length'], device=device, dtype=dtype,
+                trust_remote_code=config.trust_remote_code, local_files_only=config.local_files_only,
+                pooling=pooling)
+            if encoder.metadata['embedding_dim'] != settings['embedding_dim']:
+                raise ValueError('Document encoder output width mismatch')
+            native = encoder.encode(raw.decode('utf-8'))
+            with torch.no_grad():
+                context = network.cpu().float().eval().project_embedding(native.float())
+            context_data = embedding_bytes(context.numpy())
+            del encoder
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return dict(network=network, metadata=metadata, identity=identity, saved=saved,
+                    context_data=context_data, started=started)
     if metadata['format'] == NEMOTRON_FORMAT or network.config.architecture == 'perceiver':
         return dict(network=network, metadata=metadata, identity=identity, saved=saved,
                     context_data=(archive.context if archive else
@@ -65,7 +93,7 @@ def prepare(args, config, *, raw=None, archive=None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     context = read_embedding(context_data, network.config.embedding_dim)
-    factors, fingerprint = generate(network, context)
+    factors, fingerprint = generate(network, context, quantize=config.weight_precision == 'nf4')
     if saved and fingerprint != saved['adapter_sha256']:
         raise ValueError('Regenerated hypernetwork adapter checksum mismatch')
     header = dict(**identity, embedding_dim=network.config.embedding_dim,
@@ -118,7 +146,7 @@ def finish(prepared, config, model, tokenizer, *, raw=None):
                 values = model.get_input_embeddings()(torch.tensor(ids, device=device))
                 context_data = embedding_bytes(values.float().mean(dim=0).cpu().numpy())
     context = read_embedding(context_data, network.context_dim)
-    factors, fingerprint = generate(network, context)
+    factors, fingerprint = generate(network, context, quantize=config.weight_precision == 'nf4')
     saved = prepared['saved']
     if saved and fingerprint != saved['adapter_sha256']:
         raise ValueError('Regenerated hypernetwork adapter checksum mismatch')

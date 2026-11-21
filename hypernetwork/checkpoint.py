@@ -37,14 +37,16 @@ def inspect_checkpoint(path, expected=None):
     if recipe and metadata.get('format') == NEMOTRON_FORMAT:
         contract = metadata['contract']
         if contract.get('context') not in ('frozen_token_embedding_mean_v1',
-                                           'frozen_pre_layer_hidden_states_perceiver_v1'):
+                                           'frozen_pre_layer_hidden_states_perceiver_v1',
+                                           'prepared_document_encoder_v1'):
             raise ValueError('Unsupported Nemotron conditioning')
         metadata = dict(format=NEMOTRON_FORMAT, config=contract['hypernetwork'],
                         targets=contract['targets'],
                         backbone=dict(model='nemotron', model_path=contract['model'],
                                       revision=contract['revision']),
-                        encoder=dict(pooling=contract['context'],
-                                     max_length=contract['max_doc_tokens']),
+                        encoder=(contract['encoder'] if contract['context'] == 'prepared_document_encoder_v1'
+                                 else dict(pooling=contract['context'],
+                                           max_length=contract['max_doc_tokens'])),
                         training=dict(contract=contract))
     elif metadata.get('format') != FORMAT:
         raise ValueError('Unsupported hypernetwork checkpoint format')
@@ -80,13 +82,19 @@ def read_embedding(data, dimension):
     return torch.from_numpy(array)
 
 
-def generate(network, context):
+def generate(network, context, quantize=False):
     """Canonical CPU FP32 inference used by BOTH encoder and decoder."""
     old_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(1)
         with torch.no_grad():
             factors = network.cpu().float().eval()(context.cpu().float())
+        if quantize:
+            def quantize_factor(value):
+                scale = value.abs().max() / 7
+                return value if scale == 0 else torch.round(value / scale).clamp(-7, 7) * scale
+            factors = {name: tuple(quantize_factor(tensor) for tensor in pair)
+                       for name, pair in factors.items()}
         digest = hashlib.sha256()
         for name, pair in sorted(factors.items()):
             digest.update(name.encode())

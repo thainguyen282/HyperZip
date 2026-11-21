@@ -1,4 +1,6 @@
 """Frozen document encoder; last-token pooling and L2 normalization (GTE)."""
+import inspect
+
 import torch
 from torch.nn import functional as F
 
@@ -49,7 +51,9 @@ class DocumentEncoder:
                 raise ValueError('Encoder needs an EOS token for empty documents')
             batch = {'input_ids': torch.tensor([[token]]), 'attention_mask': torch.ones(1, 1, dtype=torch.long)}
         batch = {k: v.to(self.device) for k, v in batch.items()}
-        hidden = self.model(**batch, use_cache=False).last_hidden_state.float()
+        forward_args = inspect.signature(self.model.forward).parameters
+        options = {'use_cache': False} if 'use_cache' in forward_args else {}
+        hidden = self.model(**batch, **options).last_hidden_state.float()
         if self.pooling == 'mean':
             mask = batch['attention_mask'].unsqueeze(-1)
             vector = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
