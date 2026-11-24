@@ -13,8 +13,8 @@ class MultiModelHypernetwork(nn.Module):
     def __init__(self, specs, native_dim=1536, context_dim=512, identity_dim=32,
                  width=64, depth=2, rank=4, alpha=4):
         super().__init__()
-        if set(specs) != {'3b', '8b'}:
-            raise ValueError('Expected exactly 3b and 8b target specifications')
+        if set(specs) not in ({'3b'}, {'3b', '8b'}):
+            raise ValueError('Expected 3b, optionally with 8b, target specifications')
         if min(native_dim, context_dim, identity_dim, width, depth, rank) < 1 or alpha <= 0:
             raise ValueError('Dimensions, rank, and alpha must be positive')
         self.specs = specs
@@ -22,7 +22,7 @@ class MultiModelHypernetwork(nn.Module):
         self.model_ids = {'3b': 0, '8b': 1}
         self.module_names = sorted({s['module'] for spec in specs.values() for s in spec})
         if not self.module_names or any(not spec for spec in specs.values()):
-            raise ValueError('Both models require target projections')
+            raise ValueError('Each model requires target projections')
         self.project = nn.Linear(native_dim, context_dim)
         self.model_embedding = nn.Embedding(2, identity_dim)
         self.layer_embedding = nn.Embedding(1 + max(s['layer'] for spec in specs.values() for s in spec), identity_dim)
@@ -48,7 +48,7 @@ class MultiModelHypernetwork(nn.Module):
         return f"{spec['module']}_{spec['in_features']}_{spec['out_features']}"
 
     def forward(self, native_vector, model_id):
-        if model_id not in self.model_ids:
+        if model_id not in self.specs:
             raise ValueError('Unknown model identity')
         if native_vector.ndim != 1 or native_vector.numel() != self.project.in_features:
             raise ValueError('Document embedding has the wrong width')

@@ -61,7 +61,10 @@ def main():
     p.add_argument('--mask-token-id', type=int, default=100)
     p.add_argument('--save-every', type=int, default=500)
     p.add_argument('--max-steps', type=int, help='Stop early for a smoke test; default visits all pairs')
+    p.add_argument('--model', choices=('3b', 'both'), default='both')
     p.add_argument('--local-files-only', action='store_true')
+    p.add_argument('--wandb-project', help='Enable online W&B logging in this project')
+    p.add_argument('--wandb-name', help='W&B run name')
     args = p.parse_args()
     if min(args.sequence_length - 1, args.encoder_max_length, args.width, args.depth, args.rank,
            args.identity_dim, args.context_dim, args.save_every) < 1 or args.learning_rate <= 0 or args.alpha <= 0:
@@ -78,14 +81,15 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     models, tokenizers, specs = {}, {}, {}
-    for name, (model, revision) in MODELS.items():
+    selected_models = MODELS if args.model == 'both' else {'3b': MODELS['3b']}
+    for name, (model, revision) in selected_models.items():
         tokenizers[name] = AutoTokenizer.from_pretrained(model, revision=revision,
             trust_remote_code=True, local_files_only=args.local_files_only)
         models[name] = AutoModel.from_pretrained(model, revision=revision, trust_remote_code=True,
             local_files_only=args.local_files_only, dtype=torch.bfloat16, attn_implementation='sdpa').to(args.device).eval().requires_grad_(False)
         specs[name] = target_spec(models[name])
     encoder = DocumentEncoder(ENCODER, revision=ENCODER_REVISION, max_length=args.encoder_max_length,
-        device=args.encoder_device or args.device, dtype='bfloat16', trust_remote_code=True,
+        device=args.encoder_device or args.device, dtype='float32', trust_remote_code=True,
         local_files_only=args.local_files_only)
     settings = dict(native_dim=encoder.metadata['embedding_dim'], context_dim=args.context_dim,
                     identity_dim=args.identity_dim, width=args.width, depth=args.depth,
@@ -93,13 +97,23 @@ def main():
     network = MultiModelHypernetwork(specs, **settings).to(args.device)
     optimizer = torch.optim.AdamW(network.parameters(), lr=args.learning_rate,
                                   betas=(0.9, 0.98), eps=1e-5, weight_decay=0.1)
-    contract = {'models': MODELS, 'targets': specs, 'generator': settings, 'encoder': encoder.metadata,
+    contract = {'models': selected_models, 'targets': specs, 'generator': settings, 'encoder': encoder.metadata,
                 'source_sha256': source_hash, 'documents': len(offsets), 'seed': args.seed,
                 'sequence_length': args.sequence_length, 'mask_token_id': args.mask_token_id,
                 'objective': 'same_position_random_masked_cross_entropy_v1',
-                'schedule': 'one_shuffled_document_pass_both_models_v1', 'learning_rate': args.learning_rate}
+                'schedule': ('one_shuffled_document_pass_both_models_v1' if args.model == 'both'
+                             else 'one_shuffled_document_pass_3b_v1'), 'learning_rate': args.learning_rate}
     # JSON round-trip normalizes tuples in the model list for exact resume comparison.
     contract = json.loads(json.dumps(contract))
+    run = None
+    if args.wandb_project:
+        import wandb
+        run = wandb.init(project=args.wandb_project, name=args.wandb_name, mode='online',
+                         config={'models': selected_models, 'learning_rate': args.learning_rate,
+                                 'seed': args.seed, 'sequence_length': args.sequence_length,
+                                 'documents': len(offsets), 'source_sha256': source_hash,
+                                 'epochs': 1, 'generator': settings, 'encoder': encoder.metadata})
+        print(f'W&B run: {run.url}', flush=True)
     cursor = 0
     if args.resume:
         prior = json.loads((args.resume / 'config.json').read_text())
@@ -113,7 +127,7 @@ def main():
         np.random.set_state(state['numpy_rng'])
         random.setstate(state['python_rng'])
         cursor = prior['cursor']
-        if not 0 <= cursor <= 2 * len(offsets):
+        if not 0 <= cursor <= len(offsets) * (2 if args.model == 'both' else 1):
             raise ValueError('Invalid checkpoint cursor')
         if args.max_steps is not None and args.max_steps <= cursor:
             raise ValueError('--max-steps must exceed the restored step')
@@ -127,7 +141,10 @@ def main():
     last_saved = None
     with args.input.open('rb') as source, (args.output / 'training.jsonl').open('a') as log:
         cached_index = None
-        for index, (row_index, model_id) in enumerate(mixed_schedule(len(offsets), args.seed)):
+        schedule = mixed_schedule(len(offsets), args.seed)
+        if args.model == '3b':
+            schedule = ((row_index, model_id) for row_index, model_id in schedule if model_id == '3b')
+        for index, (row_index, model_id) in enumerate(schedule):
             if index < cursor:
                 continue
             if row_index != cached_index:
@@ -146,15 +163,22 @@ def main():
             log.write(json.dumps({'step': cursor, 'document_index': row_index, 'model': model_id,
                                   'loss': float(loss), 'gradient_norm': float(norm)}) + '\n')
             log.flush()
+            if run is not None:
+                run.log({'loss': float(loss), 'gradient_norm': float(norm),
+                         'learning_rate': args.learning_rate}, step=cursor)
             if cursor % args.save_every == 0 or stop['requested'] or (args.max_steps and cursor >= args.max_steps):
                 last_saved = save(args.output, network, optimizer, contract, cursor)
             if stop['requested'] or (args.max_steps and cursor >= args.max_steps):
                 break
     if last_saved is None or last_saved.name != f'step_{cursor}':
         last_saved = save(args.output, network, optimizer, contract, cursor)
-    status = {'steps': cursor, 'total_steps': 2 * len(offsets), 'completed_one_mixed_epoch': cursor == 2 * len(offsets),
+    total_steps = len(offsets) * (2 if args.model == 'both' else 1)
+    status = {'steps': cursor, 'total_steps': total_steps, 'completed_one_mixed_epoch': cursor == total_steps,
               'checkpoint': str(last_saved.resolve()), 'seconds': time.monotonic() - started}
     (args.output / 'run-status.json').write_text(json.dumps(status, indent=2) + '\n')
+    if run is not None:
+        run.summary['completed_one_epoch'] = cursor == total_steps
+        run.finish()
     print(json.dumps(status, indent=2))
 
 
