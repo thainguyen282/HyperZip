@@ -1,6 +1,8 @@
 """Joint 3B/8B hypernetwork training using NeMo's diffusion SFT recipe."""
 import hashlib
 import json
+import logging
+import math
 import os
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from hypernetwork.cross_model import CrossModelHypernetworkModel
 from hypernetwork.model import HyperConfig, build_hypernetwork, generated_lora, target_spec
 from hypernetwork.nemotron import checkpoint_layers
 from hypernetwork.scripts.multimodel_exp.data import PairedCollator
+from hypernetwork.scripts.multimodel_exp.distillation import masked_distillation_kl
 from hypernetwork.scripts.multimodel_exp.prepare import MODELS
 
 
@@ -115,6 +118,17 @@ class CrossModelDiffusionLMSFTRecipe(DiffusionLMSFTRecipe):
         for dataset in ('dataset', 'validation_dataset'):
             if Path(self.cfg.get(f'{dataset}.data_dir')).resolve() != Path(self.cfg.model.data_dir).resolve():
                 raise ValueError('Model and dataset must use the same prepared data')
+        self.kd_weight = float(self.cfg.get('distillation.weight', 0.0))
+        self.kd_temperature = float(self.cfg.get('distillation.temperature', 2.0))
+        self.kd_max_positions = int(self.cfg.get('distillation.max_positions', 32))
+        if not math.isfinite(self.kd_weight) or self.kd_weight < 0 or not math.isfinite(self.kd_temperature) or self.kd_temperature <= 0 or self.kd_max_positions < 1:
+            raise ValueError('Invalid knowledge distillation configuration')
+        if self.kd_weight:
+            from transformers import AutoTokenizer
+            t3 = AutoTokenizer.from_pretrained(*MODELS['3b'][:1], revision=MODELS['3b'][1], trust_remote_code=True)
+            t8 = AutoTokenizer.from_pretrained(*MODELS['8b'][:1], revision=MODELS['8b'][1], trust_remote_code=True)
+            if t3.get_vocab() != t8.get_vocab() or t3.all_special_ids != t8.all_special_ids:
+                raise ValueError('Distillation requires identical model token vocabularies and special tokens')
         super().setup()
         model = self.model_parts[0]
         expected = {id(p) for p in model.parameters() if p.requires_grad}
@@ -159,6 +173,12 @@ class CrossModelDiffusionLMSFTRecipe(DiffusionLMSFTRecipe):
         return result
 
     def _run_train_optim_step(self, batches, max_grad_norm=None):
+        if self.kd_weight:
+            for pair in batches:
+                for key in ('input_ids', 'loss_mask', 'attention_mask'):
+                    if key in pair['3b'] or key in pair['8b']:
+                        if key not in pair['3b'] or key not in pair['8b'] or not torch.equal(pair['3b'][key], pair['8b'][key]):
+                            raise ValueError(f'Distillation requires aligned paired {key}')
         return super()._run_train_optim_step(self._flatten(batches), max_grad_norm=max_grad_norm)
 
     def _apply_corruption(self, input_ids, loss_mask, microbatch_idx=0):
@@ -186,6 +206,36 @@ class CrossModelDiffusionLMSFTRecipe(DiffusionLMSFTRecipe):
         model_id = batch.pop('_cross_model_id')
         embedding = batch.pop('_cross_embedding').to(self.dist_env.device)
         model = self.model_parts[0]
+        original_loss_fn = self.dllm_loss_fn
+        if self.kd_weight and model_id == '3b' and kwargs.get('is_train', True):
+            if '_noise_mask' not in batch:
+                raise ValueError('Distillation requires precomputed training corruption')
+            device = self.dist_env.device
+            clean = batch['_clean_input_ids'].to(device)
+            mask = batch['_noise_mask'].to(device).bool() & batch['loss_mask'].to(device).bool()
+            positions = mask.reshape(-1).nonzero(as_tuple=False).flatten()[:self.kd_max_positions]
+            if positions.numel() == 0:
+                raise ValueError('Distillation requires at least one masked supervised token')
+            teacher = model.backbones[model._index('8b')]
+            teacher_hyper = model.hypernetworks[model._index('8b')]
+            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                teacher_factors = teacher_hyper(model.context('8b', embedding))
+                with generated_lora(teacher, teacher_factors, teacher_hyper.config.alpha, teacher_hyper.config.rank):
+                    teacher_out = teacher(**filter_forward_kwargs(teacher, dict(input_ids=clean, labels=clean,
+                        masked_indices=batch['_noise_mask'].to(device), skip_loss=True, use_cache=False)))
+                teacher_logits = teacher_out.logits.reshape(-1, teacher_out.logits.shape[-1])[positions].detach()
+                del teacher_out, teacher_factors
+            def loss_with_kd(**loss_kwargs):
+                base = original_loss_fn(**loss_kwargs)
+                logits = loss_kwargs['logits']
+                student = logits.reshape(-1, logits.shape[-1])[positions]
+                kd = masked_distillation_kl(student, teacher_logits, self.kd_temperature)
+                if not torch.isfinite(kd):
+                    raise RuntimeError('Nonfinite knowledge distillation loss')
+                logging.info('distillation step %s | kl %.6f | positions %s | weight %.4f',
+                             self.step_scheduler.step, kd.detach().item(), positions.numel(), self.kd_weight)
+                return base._replace(total_loss=base.total_loss + self.kd_weight * kd)
+            self.dllm_loss_fn = loss_with_kd
         model.active_model = model_id
         index = model._index(model_id)
         hyper = model.hypernetworks[index]
@@ -195,9 +245,12 @@ class CrossModelDiffusionLMSFTRecipe(DiffusionLMSFTRecipe):
         # max(..., 1) matches the native loss's zero-denominator policy.
         kwargs['num_diffusion_tokens'] = 2 * max(noise, 1)
         kwargs['num_ar_tokens'] = 2 * max(supervised, 1)
-        with checkpoint_layers(model.backbones[index]), generated_lora(
-                model.backbones[index], factors, hyper.config.alpha, hyper.config.rank):
-            super()._forward_backward_step(idx, batch, **kwargs)
+        try:
+            with checkpoint_layers(model.backbones[index]), generated_lora(
+                    model.backbones[index], factors, hyper.config.alpha, hyper.config.rank):
+                super()._forward_backward_step(idx, batch, **kwargs)
+        finally:
+            self.dllm_loss_fn = original_loss_fn
         if not torch.isfinite(kwargs['loss_buffer'][-1]):
             raise RuntimeError(f'Nonfinite {model_id} loss')
 
